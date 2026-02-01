@@ -1,4 +1,5 @@
 """A Device Tracker platform that combines one or more device trackers."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
@@ -124,6 +125,27 @@ class Location:
 
     gps: GPSType
     accuracy: float
+
+
+@dataclass
+class CollectedState:
+    """Collected state from an entity update (pure computation result)."""
+
+    entity_id: str
+    last_seen: datetime
+    source_type: SourceType
+    location_name: str | None
+    gps: GPSType | None
+    gps_accuracy: float | None
+    battery: int | None
+    charging: bool | None
+    entity_picture: str | None
+    good_entity_ids: tuple[str, ...]
+    # Speed calculation inputs (computed but not yet sent)
+    prev_lat: float | None = None
+    prev_lon: float | None = None
+    prev_seen: datetime | None = None
+    prev_entity_id: str | None = None
 
 
 @dataclass
@@ -365,9 +387,9 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
         # List of seen entity IDs used to be in ATTR_ENTITY_ID.
         # If present, move it to ATTR_ENTITIES.
         if ATTR_ENTITY_ID in self._attr_extra_state_attributes:
-            self._attr_extra_state_attributes[
-                ATTR_ENTITIES
-            ] = self._attr_extra_state_attributes.pop(ATTR_ENTITY_ID)
+            self._attr_extra_state_attributes[ATTR_ENTITIES] = (
+                self._attr_extra_state_attributes.pop(ATTR_ENTITY_ID)
+            )
         with suppress(KeyError):
             last_seen = dt_util.parse_datetime(
                 self._attr_extra_state_attributes[ATTR_LAST_SEEN]
@@ -464,12 +486,12 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
         """Return if end of driving state is being delayed."""
         return self._remove_driving_ended is not None
 
-    async def _entity_updated(  # noqa: C901
+    def _collect_new_state(  # noqa: C901
         self, entity_id: str, new_state: State | None
-    ) -> None:
-        """Run when an input entity has changed state."""
+    ) -> CollectedState | None:
+        """Collect new state from entity update (pure computation, no side effects)."""
         if not new_state or new_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-            return
+            return None
 
         entity = self._entities[entity_id]
         new_attrs = Attributes(new_state.attributes)
@@ -497,7 +519,7 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
         old_last_seen = entity.seen
         if old_last_seen and last_seen < old_last_seen:
             entity.bad("last_seen went backwards")
-            return
+            return None
 
         # Try to get GPS and battery data.
         gps: GPSType | None = None
@@ -519,8 +541,10 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
                 SourceType.GPS.value if gps and gps_accuracy is not None else None,
             )
 
+        # Capture entity picture if applicable
+        entity_picture: str | None = None
         if entity.use_picture:
-            self._attr_entity_picture = new_attrs.get(ATTR_ENTITY_PICTURE)
+            entity_picture = new_attrs.get(ATTR_ENTITY_PICTURE)
 
         state = new_state.state
         # Don't use location_name unless we have to.
@@ -530,15 +554,15 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
             # GPS coordinates and accuracy are required.
             if not gps:
                 entity.bad("missing gps attributes")
-                return
+                return None
             if gps_accuracy is None:
                 entity.bad("missing gps_accuracy attribute")
-                return
+                return None
 
             new_data = Location(gps, gps_accuracy)
             old_data = cast(Location | None, entity.data)
             if last_seen == old_last_seen and new_data == old_data:
-                return
+                return None
             entity.good(last_seen, SourceType.GPS, new_data)
 
             if self._req_movement and old_data:
@@ -549,7 +573,7 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
                         self.entity_id,
                         entity_id,
                     )
-                    return
+                    return None
 
         elif source_type in SourceType:
             # Convert 'on'/'off' state of binary_sensor
@@ -563,7 +587,7 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
             entity.good(last_seen, SourceType(source_type), state)  # type: ignore[arg-type]
 
             if not self._use_non_gps_data(entity_id, state):
-                return
+                return None
 
             # Don't use new GPS data if it's not complete.
             if not gps or gps_accuracy is None:
@@ -606,7 +630,7 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
 
         else:
             entity.bad(f"unsupported source_type: {source_type}")
-            return
+            return None
 
         # Is this newer info than last update?
         if self._prev_seen and last_seen <= self._prev_seen:
@@ -618,88 +642,116 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
                 dt_util.as_local(last_seen),
                 dt_util.as_local(self._prev_seen),
             )
-            return
+            return None
 
-        _LOGGER.debug("Updating %s from %s", self.entity_id, entity_id)
+        _LOGGER.debug("Collecting state for %s from %s", self.entity_id, entity_id)
 
-        attrs = {
-            ATTR_ENTITIES: tuple(
-                entity_id
-                for entity_id, _entity in self._entities.items()
-                if _entity.is_good
-            ),
-            ATTR_LAST_ENTITY_ID: entity_id,
-            ATTR_LAST_SEEN: dt_util.as_local(_nearest_second(last_seen)),
-        }
-        if charging is not None:
-            attrs[ATTR_BATTERY_CHARGING] = charging
-
-        self._set_state(
-            location_name, gps, gps_accuracy, battery, attrs, SourceType(source_type)  # type: ignore[arg-type]
+        good_entity_ids = tuple(
+            eid for eid, ent in self._entities.items() if ent.is_good
         )
 
-        self._prev_seen = last_seen
-
-    def _set_state(
-        self,
-        location_name: str | None,
-        gps: GPSType | None,
-        gps_accuracy: float | None,
-        battery: int | None,
-        attributes: dict,
-        source_type: SourceType,
-    ) -> None:
-        """Set new state."""
-        # Save previously "seen" values before updating for speed calculations, etc.
-        prev_ent: str | None
-        prev_lat: float | None
-        prev_lon: float | None
+        # Capture previous state for speed calculation
+        prev_lat: float | None = None
+        prev_lon: float | None = None
+        prev_seen: datetime | None = None
+        prev_entity_id: str | None = None
         if self._prev_seen:
-            prev_ent = self._attr_extra_state_attributes[ATTR_LAST_ENTITY_ID]
+            prev_entity_id = self._attr_extra_state_attributes.get(ATTR_LAST_ENTITY_ID)
             prev_lat = self.latitude
             prev_lon = self.longitude
-        else:
-            # Don't use restored attributes.
-            prev_ent = prev_lat = prev_lon = None
+            prev_seen = self._prev_seen
+
+        return CollectedState(
+            entity_id=entity_id,
+            last_seen=last_seen,
+            source_type=SourceType(source_type),  # type: ignore[arg-type]
+            location_name=location_name,
+            gps=gps,
+            gps_accuracy=gps_accuracy,
+            battery=battery,
+            charging=charging,
+            entity_picture=entity_picture,
+            good_entity_ids=good_entity_ids,
+            prev_lat=prev_lat,
+            prev_lon=prev_lon,
+            prev_seen=prev_seen,
+            prev_entity_id=prev_entity_id,
+        )
+
+    def _apply_state(self, data: CollectedState) -> None:
+        """Apply collected state to internal fields (single mutation point)."""
+        # Update entity picture if provided
+        if data.entity_picture is not None:
+            self._attr_entity_picture = data.entity_picture
+
+        # Compute speed before updating position
+        speed, angle, use_new_speed = self._compute_speed(data)
+
+        # Check if we were driving before this update
         was_driving = (
             self._prev_speed is not None
             and self._driving_speed is not None
             and self._prev_speed >= self._driving_speed
         )
 
-        self._battery_level = battery
-        self._attr_source_type = source_type
-        self._attr_location_accuracy = gps_accuracy or 0
-        self._attr_location_name = location_name
-        lat: float | None
-        lon: float | None
-        if gps:
-            lat, lon = gps
+        # Update core state attributes
+        self._battery_level = data.battery
+        self._attr_source_type = data.source_type
+        self._attr_location_accuracy = data.gps_accuracy or 0
+        self._attr_location_name = data.location_name
+
+        if data.gps:
+            self._attr_latitude, self._attr_longitude = data.gps
         else:
-            lat = lon = None
-        self._attr_latitude = lat
-        self._attr_longitude = lon
+            self._attr_latitude = self._attr_longitude = None
 
-        self._attr_extra_state_attributes = attributes
+        # Build extra state attributes
+        attrs: dict[str, Any] = {
+            ATTR_ENTITIES: data.good_entity_ids,
+            ATTR_LAST_ENTITY_ID: data.entity_id,
+            ATTR_LAST_SEEN: dt_util.as_local(_nearest_second(data.last_seen)),
+        }
+        if data.charging is not None:
+            attrs[ATTR_BATTERY_CHARGING] = data.charging
+        self._attr_extra_state_attributes = attrs
 
-        last_seen = cast(datetime, attributes[ATTR_LAST_SEEN])
-        speed = None
-        angle = None
+        # Update timestamp tracking
+        self._prev_seen = data.last_seen
+
+        # Handle speed sensor updates
+        if use_new_speed:
+            self._send_speed(speed, angle)
+            self._prev_speed = speed
+            self._start_speed_stale_monitor()
+        else:
+            speed = self._prev_speed
+
+        # Handle driving state
+        self._update_driving_state(speed, was_driving)
+
+    def _compute_speed(
+        self, data: CollectedState
+    ) -> tuple[float | None, int | None, bool]:
+        """Compute speed and angle from collected state (pure computation)."""
+        speed: float | None = None
+        angle: int | None = None
         use_new_speed = True
+
+        lat = data.gps[0] if data.gps else None
+        lon = data.gps[1] if data.gps else None
+
         if (
-            prev_ent
-            and self._prev_seen
-            and prev_lat is not None
-            and prev_lon is not None
+            data.prev_entity_id
+            and data.prev_seen
+            and data.prev_lat is not None
+            and data.prev_lon is not None
             and lat is not None
             and lon is not None
         ):
-            # It's ok that last_seen is in local tz and self._prev_seen is in UTC.
-            # last_seen's value will automatically be converted to UTC during the
-            # subtraction operation.
-            seconds = (last_seen - self._prev_seen).total_seconds()
+            last_seen_local = dt_util.as_local(_nearest_second(data.last_seen))
+            seconds = (last_seen_local - data.prev_seen).total_seconds()
             min_seconds = MIN_SPEED_SECONDS
-            if cast(str, attributes[ATTR_LAST_ENTITY_ID]) != prev_ent:
+            if data.entity_id != data.prev_entity_id:
                 min_seconds *= 3
             if seconds < min_seconds:
                 _LOGGER.debug(
@@ -710,24 +762,23 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
                 )
                 use_new_speed = False
             else:
-                meters = cast(float, distance(prev_lat, prev_lon, lat, lon))
+                meters = cast(float, distance(data.prev_lat, data.prev_lon, lat, lon))
                 try:
                     speed = round(meters / seconds, 1)
                 except TypeError:
                     _LOGGER.error("%s: distance() returned None", self.name)
                 else:
                     if speed > MIN_ANGLE_SPEED:
-                        angle = round(degrees(atan2(lon - prev_lon, lat - prev_lat)))
+                        angle = round(
+                            degrees(atan2(lon - data.prev_lon, lat - data.prev_lat))
+                        )
                         if angle < 0:
                             angle += 360
 
-        if use_new_speed:
-            self._send_speed(speed, angle)
-            self._prev_speed = speed
-            self._start_speed_stale_monitor()
-        else:
-            speed = self._prev_speed
+        return speed, angle, use_new_speed
 
+    def _update_driving_state(self, speed: float | None, was_driving: bool) -> None:
+        """Update driving state based on speed."""
         # Only set state to driving if it's currently "away" (i.e., not in a zone.)
         if self.state != STATE_NOT_HOME:
             self._cancel_drive_ending_delay()
@@ -746,6 +797,13 @@ class CompositeDeviceTracker(TrackerEntity, RestoreEntity):
 
         if driving or self._drive_ending_delayed:
             self._attr_location_name = STATE_DRIVING
+
+    async def _entity_updated(self, entity_id: str, new_state: State | None) -> None:
+        """Run when an input entity has changed state."""
+        data = self._collect_new_state(entity_id, new_state)
+        if data is None:
+            return
+        self._apply_state(data)
 
     def _use_non_gps_data(self, entity_id: str, state: str) -> bool:
         """Determine if state should be used for non-GPS based entity."""
